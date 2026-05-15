@@ -56,6 +56,7 @@ fn usage_limit_reached_error_formats_plus_plan() {
         resets_at: None,
         rate_limits: Some(Box::new(rate_limit_snapshot())),
         promo_message: None,
+        user_timezone: None,
     };
     assert_eq!(
         err.to_string(),
@@ -177,6 +178,7 @@ fn usage_limit_reached_error_formats_free_plan() {
         resets_at: None,
         rate_limits: Some(Box::new(rate_limit_snapshot())),
         promo_message: None,
+        user_timezone: None,
     };
     assert_eq!(
         err.to_string(),
@@ -191,6 +193,7 @@ fn usage_limit_reached_error_formats_go_plan() {
         resets_at: None,
         rate_limits: Some(Box::new(rate_limit_snapshot())),
         promo_message: None,
+        user_timezone: None,
     };
     assert_eq!(
         err.to_string(),
@@ -205,6 +208,7 @@ fn usage_limit_reached_error_formats_default_when_none() {
         resets_at: None,
         rate_limits: Some(Box::new(rate_limit_snapshot())),
         promo_message: None,
+        user_timezone: None,
     };
     assert_eq!(
         err.to_string(),
@@ -217,12 +221,13 @@ fn usage_limit_reached_error_formats_team_plan() {
     let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
     let resets_at = base + ChronoDuration::hours(1);
     with_now_override(base, move || {
-        let expected_time = format_retry_timestamp(&resets_at);
+        let expected_time = format_retry_timestamp(&resets_at, Some("Asia/Seoul"));
         let err = UsageLimitReachedError {
             plan_type: Some(PlanType::Known(KnownPlan::Team)),
             resets_at: Some(resets_at),
             rate_limits: Some(Box::new(rate_limit_snapshot())),
             promo_message: None,
+            user_timezone: Some("Asia/Seoul".to_string()),
         };
         let expected = format!(
             "You've hit your usage limit. To get more access now, send a request to your admin or try again at {expected_time}."
@@ -238,6 +243,7 @@ fn usage_limit_reached_error_formats_business_plan_without_reset() {
         resets_at: None,
         rate_limits: Some(Box::new(rate_limit_snapshot())),
         promo_message: None,
+        user_timezone: None,
     };
     assert_eq!(
         err.to_string(),
@@ -252,6 +258,7 @@ fn usage_limit_reached_error_formats_self_serve_business_usage_based_plan() {
         resets_at: None,
         rate_limits: Some(Box::new(rate_limit_snapshot())),
         promo_message: None,
+        user_timezone: None,
     };
     assert_eq!(
         err.to_string(),
@@ -266,6 +273,7 @@ fn usage_limit_reached_error_formats_enterprise_cbp_usage_based_plan() {
         resets_at: None,
         rate_limits: Some(Box::new(rate_limit_snapshot())),
         promo_message: None,
+        user_timezone: None,
     };
     assert_eq!(
         err.to_string(),
@@ -280,6 +288,7 @@ fn usage_limit_reached_error_formats_default_for_other_plans() {
         resets_at: None,
         rate_limits: Some(Box::new(rate_limit_snapshot())),
         promo_message: None,
+        user_timezone: None,
     };
     assert_eq!(
         err.to_string(),
@@ -292,12 +301,13 @@ fn usage_limit_reached_error_formats_pro_plan_with_reset() {
     let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
     let resets_at = base + ChronoDuration::hours(1);
     with_now_override(base, move || {
-        let expected_time = format_retry_timestamp(&resets_at);
+        let expected_time = format_retry_timestamp(&resets_at, None);
         let err = UsageLimitReachedError {
             plan_type: Some(PlanType::Known(KnownPlan::Pro)),
             resets_at: Some(resets_at),
             rate_limits: Some(Box::new(rate_limit_snapshot())),
             promo_message: None,
+            user_timezone: None,
         };
         let expected = format!(
             "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at {expected_time}."
@@ -311,7 +321,7 @@ fn usage_limit_reached_error_hides_upsell_for_non_codex_limit_name() {
     let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
     let resets_at = base + ChronoDuration::hours(1);
     with_now_override(base, move || {
-        let expected_time = format_retry_timestamp(&resets_at);
+        let expected_time = format_retry_timestamp(&resets_at, None);
         let err = UsageLimitReachedError {
             plan_type: Some(PlanType::Known(KnownPlan::Plus)),
             resets_at: Some(resets_at),
@@ -324,6 +334,7 @@ fn usage_limit_reached_error_hides_upsell_for_non_codex_limit_name() {
                 "Visit https://chatgpt.com/codex/settings/usage to purchase more credits"
                     .to_string(),
             ),
+            user_timezone: None,
         };
         let expected = format!(
             "You've hit your usage limit for codex_other. Switch to another model now, or try again at {expected_time}."
@@ -337,15 +348,100 @@ fn usage_limit_reached_includes_minutes_when_available() {
     let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
     let resets_at = base + ChronoDuration::minutes(5);
     with_now_override(base, move || {
-        let expected_time = format_retry_timestamp(&resets_at);
+        let expected_time = format_retry_timestamp(&resets_at, None);
         let err = UsageLimitReachedError {
             plan_type: None,
             resets_at: Some(resets_at),
             rate_limits: Some(Box::new(rate_limit_snapshot())),
             promo_message: None,
+            user_timezone: None,
         };
         let expected = format!("You've hit your usage limit. Try again at {expected_time}.");
         assert_eq!(err.to_string(), expected);
+    });
+}
+
+#[test]
+fn usage_limit_reached_formats_same_day_in_user_timezone() {
+    let base = Utc.with_ymd_and_hms(2024, 1, 1, 3, 0, 0).unwrap();
+    let resets_at = Utc.with_ymd_and_hms(2024, 1, 1, 5, 47, 0).unwrap();
+    with_now_override(base, move || {
+        let err = UsageLimitReachedError {
+            plan_type: None,
+            resets_at: Some(resets_at),
+            rate_limits: Some(Box::new(rate_limit_snapshot())),
+            promo_message: None,
+            user_timezone: Some("Asia/Seoul".to_string()),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "You've hit your usage limit. Try again at 2:47 PM (Asia/Seoul)."
+        );
+    });
+}
+
+#[test]
+fn usage_limit_reached_formats_other_day_in_user_timezone() {
+    let base = Utc.with_ymd_and_hms(2024, 1, 1, 3, 0, 0).unwrap();
+    let resets_at = Utc.with_ymd_and_hms(2024, 1, 2, 6, 47, 0).unwrap();
+    with_now_override(base, move || {
+        let err = UsageLimitReachedError {
+            plan_type: None,
+            resets_at: Some(resets_at),
+            rate_limits: Some(Box::new(rate_limit_snapshot())),
+            promo_message: None,
+            user_timezone: Some("Asia/Seoul".to_string()),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "You've hit your usage limit. Try again at Jan 2nd, 2024 3:47 PM (Asia/Seoul)."
+        );
+    });
+}
+
+#[test]
+fn usage_limit_reached_missing_user_timezone_falls_back_without_label() {
+    let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+    let resets_at = base + ChronoDuration::minutes(5);
+    with_now_override(base, move || {
+        let expected_time = format_retry_timestamp(&resets_at, None);
+        let err = UsageLimitReachedError {
+            plan_type: None,
+            resets_at: Some(resets_at),
+            rate_limits: Some(Box::new(rate_limit_snapshot())),
+            promo_message: None,
+            user_timezone: None,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            format!("You've hit your usage limit. Try again at {expected_time}.")
+        );
+        assert!(!err.to_string().contains('('));
+    });
+}
+
+#[test]
+fn usage_limit_reached_invalid_user_timezone_falls_back_without_label() {
+    let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+    let resets_at = base + ChronoDuration::minutes(5);
+    with_now_override(base, move || {
+        let expected_time = format_retry_timestamp(&resets_at, None);
+        let err = UsageLimitReachedError {
+            plan_type: None,
+            resets_at: Some(resets_at),
+            rate_limits: Some(Box::new(rate_limit_snapshot())),
+            promo_message: None,
+            user_timezone: Some("Not/A_Timezone".to_string()),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            format!("You've hit your usage limit. Try again at {expected_time}.")
+        );
+        assert!(!err.to_string().contains("(Not/A_Timezone)"));
     });
 }
 
@@ -476,12 +572,13 @@ fn usage_limit_reached_includes_hours_and_minutes() {
     let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
     let resets_at = base + ChronoDuration::hours(3) + ChronoDuration::minutes(32);
     with_now_override(base, move || {
-        let expected_time = format_retry_timestamp(&resets_at);
+        let expected_time = format_retry_timestamp(&resets_at, None);
         let err = UsageLimitReachedError {
             plan_type: Some(PlanType::Known(KnownPlan::Plus)),
             resets_at: Some(resets_at),
             rate_limits: Some(Box::new(rate_limit_snapshot())),
             promo_message: None,
+            user_timezone: None,
         };
         let expected = format!(
             "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at {expected_time}."
@@ -496,12 +593,13 @@ fn usage_limit_reached_includes_days_hours_minutes() {
     let resets_at =
         base + ChronoDuration::days(2) + ChronoDuration::hours(3) + ChronoDuration::minutes(5);
     with_now_override(base, move || {
-        let expected_time = format_retry_timestamp(&resets_at);
+        let expected_time = format_retry_timestamp(&resets_at, None);
         let err = UsageLimitReachedError {
             plan_type: None,
             resets_at: Some(resets_at),
             rate_limits: Some(Box::new(rate_limit_snapshot())),
             promo_message: None,
+            user_timezone: None,
         };
         let expected = format!("You've hit your usage limit. Try again at {expected_time}.");
         assert_eq!(err.to_string(), expected);
@@ -513,12 +611,13 @@ fn usage_limit_reached_less_than_minute() {
     let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
     let resets_at = base + ChronoDuration::seconds(30);
     with_now_override(base, move || {
-        let expected_time = format_retry_timestamp(&resets_at);
+        let expected_time = format_retry_timestamp(&resets_at, None);
         let err = UsageLimitReachedError {
             plan_type: None,
             resets_at: Some(resets_at),
             rate_limits: Some(Box::new(rate_limit_snapshot())),
             promo_message: None,
+            user_timezone: None,
         };
         let expected = format!("You've hit your usage limit. Try again at {expected_time}.");
         assert_eq!(err.to_string(), expected);
@@ -530,7 +629,7 @@ fn usage_limit_reached_with_promo_message() {
     let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
     let resets_at = base + ChronoDuration::seconds(30);
     with_now_override(base, move || {
-        let expected_time = format_retry_timestamp(&resets_at);
+        let expected_time = format_retry_timestamp(&resets_at, None);
         let err = UsageLimitReachedError {
             plan_type: None,
             resets_at: Some(resets_at),
@@ -538,6 +637,7 @@ fn usage_limit_reached_with_promo_message() {
             promo_message: Some(
                 "To continue using Codex, start a free trial of <PLAN> today".to_string(),
             ),
+            user_timezone: None,
         };
         let expected = format!(
             "You've hit your usage limit. To continue using Codex, start a free trial of <PLAN> today, or try again at {expected_time}."

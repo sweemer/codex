@@ -122,17 +122,23 @@ async fn run_remote_compact_task_inner(
         client_session,
         initial_context_injection,
     )
-    .await;
+    .await
+    .map_err(|err| match err {
+        CodexErr::UsageLimitReached(err) => CodexErr::UsageLimitReached(
+            err.with_user_timezone_if_missing(turn_context.timezone.clone()),
+        ),
+        other => other,
+    });
     let status = compaction_status_from_result(&result);
     let error = result.as_ref().err().map(ToString::to_string);
     if result.is_ok() {
         let post_compact_outcome = run_post_compact_hooks(sess, turn_context, trigger).await;
         if let PostCompactHookOutcome::Stopped = post_compact_outcome {
-            attempt.track(sess.as_ref(), status, error).await;
+            attempt.track(sess.as_ref(), status, error.clone()).await;
             return Err(CodexErr::TurnAborted);
         }
     }
-    attempt.track(sess.as_ref(), status, error.clone()).await;
+    attempt.track(sess.as_ref(), status, error).await;
     if let Err(err) = result {
         let event = EventMsg::Error(
             err.to_error_event(Some("Error running remote compact task".to_string())),

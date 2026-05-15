@@ -13,6 +13,7 @@ use chrono::DateTime;
 use chrono::Datelike;
 use chrono::Local;
 use chrono::Utc;
+use chrono_tz::Tz;
 use codex_async_utils::CancelErr;
 use codex_utils_string::truncate_middle_chars;
 use codex_utils_string::truncate_middle_with_token_budget;
@@ -448,6 +449,16 @@ pub struct UsageLimitReachedError {
     pub resets_at: Option<DateTime<Utc>>,
     pub rate_limits: Option<Box<RateLimitSnapshot>>,
     pub promo_message: Option<String>,
+    pub user_timezone: Option<String>,
+}
+
+impl UsageLimitReachedError {
+    pub fn with_user_timezone_if_missing(mut self, user_timezone: Option<String>) -> Self {
+        if self.user_timezone.is_none() {
+            self.user_timezone = user_timezone;
+        }
+        self
+    }
 }
 
 impl std::fmt::Display for UsageLimitReachedError {
@@ -463,7 +474,7 @@ impl std::fmt::Display for UsageLimitReachedError {
             return write!(
                 f,
                 "You've hit your usage limit for {limit_name}. Switch to another model now,{}",
-                retry_suffix_after_or(self.resets_at.as_ref())
+                retry_suffix_after_or(self.resets_at.as_ref(), self.user_timezone.as_deref())
             );
         }
 
@@ -471,14 +482,14 @@ impl std::fmt::Display for UsageLimitReachedError {
             return write!(
                 f,
                 "You've hit your usage limit. {promo_message},{}",
-                retry_suffix_after_or(self.resets_at.as_ref())
+                retry_suffix_after_or(self.resets_at.as_ref(), self.user_timezone.as_deref())
             );
         }
 
         let message = match self.plan_type.as_ref() {
             Some(PlanType::Known(KnownPlan::Plus)) => format!(
                 "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits{}",
-                retry_suffix_after_or(self.resets_at.as_ref())
+                retry_suffix_after_or(self.resets_at.as_ref(), self.user_timezone.as_deref())
             ),
             Some(PlanType::Known(
                 KnownPlan::Team
@@ -488,27 +499,27 @@ impl std::fmt::Display for UsageLimitReachedError {
             )) => {
                 format!(
                     "You've hit your usage limit. To get more access now, send a request to your admin{}",
-                    retry_suffix_after_or(self.resets_at.as_ref())
+                    retry_suffix_after_or(self.resets_at.as_ref(), self.user_timezone.as_deref())
                 )
             }
             Some(PlanType::Known(KnownPlan::Free)) | Some(PlanType::Known(KnownPlan::Go)) => {
                 format!(
                     "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus),{}",
-                    retry_suffix_after_or(self.resets_at.as_ref())
+                    retry_suffix_after_or(self.resets_at.as_ref(), self.user_timezone.as_deref())
                 )
             }
             Some(PlanType::Known(KnownPlan::Pro | KnownPlan::ProLite)) => format!(
                 "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits{}",
-                retry_suffix_after_or(self.resets_at.as_ref())
+                retry_suffix_after_or(self.resets_at.as_ref(), self.user_timezone.as_deref())
             ),
             Some(PlanType::Known(KnownPlan::Enterprise))
             | Some(PlanType::Known(KnownPlan::Edu)) => format!(
                 "You've hit your usage limit.{}",
-                retry_suffix(self.resets_at.as_ref())
+                retry_suffix(self.resets_at.as_ref(), self.user_timezone.as_deref())
             ),
             Some(PlanType::Unknown(_)) | None => format!(
                 "You've hit your usage limit.{}",
-                retry_suffix(self.resets_at.as_ref())
+                retry_suffix(self.resets_at.as_ref(), self.user_timezone.as_deref())
             ),
         };
 
@@ -516,34 +527,59 @@ impl std::fmt::Display for UsageLimitReachedError {
     }
 }
 
-fn retry_suffix(resets_at: Option<&DateTime<Utc>>) -> String {
+fn retry_suffix(resets_at: Option<&DateTime<Utc>>, user_timezone: Option<&str>) -> String {
     if let Some(resets_at) = resets_at {
-        let formatted = format_retry_timestamp(resets_at);
+        let formatted = format_retry_timestamp(resets_at, user_timezone);
         format!(" Try again at {formatted}.")
     } else {
         " Try again later.".to_string()
     }
 }
 
-fn retry_suffix_after_or(resets_at: Option<&DateTime<Utc>>) -> String {
+fn retry_suffix_after_or(resets_at: Option<&DateTime<Utc>>, user_timezone: Option<&str>) -> String {
     if let Some(resets_at) = resets_at {
-        let formatted = format_retry_timestamp(resets_at);
+        let formatted = format_retry_timestamp(resets_at, user_timezone);
         format!(" or try again at {formatted}.")
     } else {
         " or try again later.".to_string()
     }
 }
 
-fn format_retry_timestamp(resets_at: &DateTime<Utc>) -> String {
+fn format_retry_timestamp(resets_at: &DateTime<Utc>, user_timezone: Option<&str>) -> String {
+    if let Some(user_timezone) = user_timezone
+        && let Ok(timezone) = user_timezone.parse::<Tz>()
+    {
+        let reset_at = resets_at.with_timezone(&timezone);
+        let now = now_for_retry().with_timezone(&timezone);
+        return format_retry_timestamp_with_zone_label(reset_at, now, Some(user_timezone));
+    }
+
     let local_reset = resets_at.with_timezone(&Local);
     let local_now = now_for_retry().with_timezone(&Local);
-    if local_reset.date_naive() == local_now.date_naive() {
-        local_reset.format("%-I:%M %p").to_string()
+    format_retry_timestamp_with_zone_label(local_reset, local_now, None)
+}
+
+fn format_retry_timestamp_with_zone_label<Tz: chrono::TimeZone>(
+    reset_at: DateTime<Tz>,
+    now: DateTime<Tz>,
+    zone_label: Option<&str>,
+) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let formatted = if reset_at.date_naive() == now.date_naive() {
+        reset_at.format("%-I:%M %p").to_string()
     } else {
-        let suffix = day_suffix(local_reset.day());
-        local_reset
+        let suffix = day_suffix(reset_at.day());
+        reset_at
             .format(&format!("%b %-d{suffix}, %Y %-I:%M %p"))
             .to_string()
+    };
+
+    if let Some(zone_label) = zone_label {
+        format!("{formatted} ({zone_label})")
+    } else {
+        formatted
     }
 }
 

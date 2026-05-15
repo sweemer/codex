@@ -113,8 +113,14 @@ async fn run_remote_compact_task_inner(
             return Err(CodexErr::TurnAborted);
         }
     }
-    let result =
-        run_remote_compact_task_inner_impl(sess, turn_context, initial_context_injection).await;
+    let result = run_remote_compact_task_inner_impl(sess, turn_context, initial_context_injection)
+        .await
+        .map_err(|err| match err {
+            CodexErr::UsageLimitReached(err) => CodexErr::UsageLimitReached(
+                err.with_user_timezone_if_missing(turn_context.timezone.clone()),
+            ),
+            other => other,
+        });
     let status = compaction_status_from_result(&result);
     let error = result.as_ref().err().map(ToString::to_string);
     if result.is_ok() {
@@ -385,4 +391,45 @@ pub(crate) fn trim_function_call_history_to_fit_context_window(
     }
 
     deleted_items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::tests::make_session_and_context_with_rx;
+    use chrono::TimeZone;
+    use chrono::Utc;
+    use codex_protocol::auth::KnownPlan;
+    use codex_protocol::auth::PlanType;
+    use codex_protocol::error::UsageLimitReachedError;
+    use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn remote_compact_usage_limit_error_includes_turn_timezone() {
+        let (_session, mut turn_context, _rx) = make_session_and_context_with_rx().await;
+        Arc::get_mut(&mut turn_context)
+            .expect("turn context should be uniquely owned in test")
+            .timezone = Some("Asia/Seoul".to_string());
+
+        let resets_at = Utc.with_ymd_and_hms(2024, 1, 1, 5, 47, 0).unwrap();
+        let err = match CodexErr::UsageLimitReached(UsageLimitReachedError {
+            plan_type: Some(PlanType::Known(KnownPlan::Pro)),
+            resets_at: Some(resets_at),
+            rate_limits: None,
+            promo_message: None,
+            user_timezone: None,
+        }) {
+            CodexErr::UsageLimitReached(err) => CodexErr::UsageLimitReached(
+                err.with_user_timezone_if_missing(turn_context.timezone.clone()),
+            ),
+            other => other,
+        };
+
+        let event = err.to_error_event(Some("Error running remote compact task".to_string()));
+
+        assert_eq!(
+            event.message,
+            "Error running remote compact task: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jan 1st, 2024 2:47 PM (Asia/Seoul)."
+        );
+    }
 }

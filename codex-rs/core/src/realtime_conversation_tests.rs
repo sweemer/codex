@@ -1,9 +1,12 @@
 use super::RealtimeHandoffState;
 use super::RealtimeSessionKind;
+use super::map_realtime_api_error;
 use super::realtime_delegation_from_handoff;
 use super::realtime_text_from_handoff_request;
 use super::wrap_realtime_delegation_input;
 use async_channel::bounded;
+use codex_api::ApiError;
+use codex_api::TransportError;
 use codex_protocol::protocol::RealtimeHandoffRequested;
 use codex_protocol::protocol::RealtimeTranscriptEntry;
 use pretty_assertions::assert_eq;
@@ -136,4 +139,30 @@ async fn clears_active_handoff_explicitly() {
 
     *state.active_handoff.lock().await = None;
     assert_eq!(state.active_handoff.lock().await.clone(), None);
+}
+
+#[test]
+fn realtime_usage_limit_errors_use_session_timezone() {
+    let body = serde_json::json!({
+        "error": {
+            "type": "usage_limit_reached",
+            "plan_type": "enterprise",
+            "resets_at": 1_893_456_000,
+        }
+    })
+    .to_string();
+    let mapped_error = map_realtime_api_error(
+        ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            url: Some("http://example.com/v1/realtime".to_string()),
+            headers: None,
+            body: Some(body),
+        }),
+        Some("Asia/Seoul"),
+    );
+
+    assert_eq!(
+        mapped_error.to_string(),
+        "You've hit your usage limit. Try again at Jan 1st, 2030 9:00 AM (Asia/Seoul)."
+    );
 }

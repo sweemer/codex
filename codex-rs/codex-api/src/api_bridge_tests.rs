@@ -228,3 +228,29 @@ fn map_api_error_extracts_identity_auth_details_from_headers() {
     );
     assert_eq!(err.identity_error_code.as_deref(), Some("token_expired"));
 }
+
+#[test]
+fn map_api_error_with_user_timezone_formats_usage_limit_in_user_zone() {
+    let body = serde_json::json!({
+        "error": {
+            "type": "usage_limit_reached",
+            "plan_type": "enterprise",
+            "resets_at": 1_893_456_000,
+        }
+    })
+    .to_string();
+    let err = map_api_error_with_user_timezone(
+        ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            url: Some("http://example.com/v1/responses".to_string()),
+            headers: None,
+            body: Some(body),
+        }),
+        Some("Asia/Seoul".to_string()),
+    );
+
+    assert_eq!(
+        err.to_string(),
+        "You've hit your usage limit. Try again at Jan 1st, 2030 9:00 AM (Asia/Seoul)."
+    );
+}

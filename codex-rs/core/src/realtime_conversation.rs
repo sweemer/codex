@@ -2,6 +2,7 @@ use crate::client::ModelClient;
 use crate::realtime_context::build_realtime_startup_context;
 use crate::realtime_prompt::prepare_realtime_backend_prompt;
 use crate::session::session::Session;
+use crate::session::turn_context::local_time_context;
 use anyhow::Context;
 use async_channel::Receiver;
 use async_channel::RecvError;
@@ -19,7 +20,7 @@ use codex_api::RealtimeSessionMode;
 use codex_api::RealtimeWebsocketClient;
 use codex_api::RealtimeWebsocketEvents;
 use codex_api::RealtimeWebsocketWriter;
-use codex_api::map_api_error;
+use codex_api::map_api_error_with_user_timezone;
 use codex_app_server_protocol::AuthMode;
 use codex_config::config_toml::RealtimeWsMode;
 use codex_config::config_toml::RealtimeWsVersion;
@@ -134,12 +135,14 @@ impl RealtimeResponseCreateQueue {
         writer: &RealtimeWebsocketWriter,
         events_tx: &Sender<RealtimeEvent>,
         reason: &str,
+        user_timezone: Option<&str>,
     ) -> anyhow::Result<()> {
         if self.active_default_response {
             self.pending_create = true;
             return Ok(());
         }
-        self.send_create_now(writer, events_tx, reason).await
+        self.send_create_now(writer, events_tx, reason, user_timezone)
+            .await
     }
 
     fn mark_started(&mut self) {
@@ -151,13 +154,15 @@ impl RealtimeResponseCreateQueue {
         writer: &RealtimeWebsocketWriter,
         events_tx: &Sender<RealtimeEvent>,
         reason: &str,
+        user_timezone: Option<&str>,
     ) -> anyhow::Result<()> {
         self.active_default_response = false;
         if !self.pending_create {
             return Ok(());
         }
         self.pending_create = false;
-        self.send_create_now(writer, events_tx, reason).await
+        self.send_create_now(writer, events_tx, reason, user_timezone)
+            .await
     }
 
     async fn send_create_now(
@@ -165,9 +170,10 @@ impl RealtimeResponseCreateQueue {
         writer: &RealtimeWebsocketWriter,
         events_tx: &Sender<RealtimeEvent>,
         reason: &str,
+        user_timezone: Option<&str>,
     ) -> anyhow::Result<()> {
         if let Err(err) = writer.send_response_create().await {
-            let mapped_error = map_api_error(err);
+            let mapped_error = map_realtime_api_error(err, user_timezone);
             let error_message = mapped_error.to_string();
             if error_message.starts_with(REALTIME_ACTIVE_RESPONSE_ERROR_PREFIX) {
                 warn!("realtime response.create raced an active response; deferring");
@@ -194,6 +200,7 @@ struct RealtimeInputTask {
     handoff_state: RealtimeHandoffState,
     session_kind: RealtimeSessionKind,
     event_parser: RealtimeEventParser,
+    user_timezone: Option<String>,
 }
 
 struct RealtimeInputChannels {
@@ -230,6 +237,7 @@ struct RealtimeStart {
     session_config: RealtimeSessionConfig,
     model_client: ModelClient,
     sdp: Option<String>,
+    user_timezone: Option<String>,
 }
 
 struct RealtimeStartOutput {
@@ -282,6 +290,7 @@ impl RealtimeConversationManager {
             session_config,
             model_client,
             sdp,
+            user_timezone,
         } = start;
         let event_parser = session_config.event_parser;
         let session_kind = match event_parser {
@@ -314,7 +323,13 @@ impl RealtimeConversationManager {
                     session_config.clone(),
                     extra_headers.unwrap_or_default(),
                 )
-                .await?;
+                .await
+                .map_err(|err| match err {
+                    CodexErr::UsageLimitReached(err) => CodexErr::UsageLimitReached(
+                        err.with_user_timezone_if_missing(user_timezone.clone()),
+                    ),
+                    other => other,
+                })?;
             let task = spawn_webrtc_sideband_input_task(RealtimeWebrtcSidebandInputTask {
                 client,
                 session_config,
@@ -326,6 +341,7 @@ impl RealtimeConversationManager {
                 session_kind,
                 event_parser,
                 realtime_active: Arc::clone(&realtime_active),
+                user_timezone: user_timezone.clone(),
             });
             (task, Some(call.sdp))
         } else {
@@ -336,7 +352,7 @@ impl RealtimeConversationManager {
                     default_headers(),
                 )
                 .await
-                .map_err(map_api_error)?;
+                .map_err(|err| map_realtime_api_error(err, user_timezone.as_deref()))?;
             let task = spawn_realtime_input_task(RealtimeInputTask {
                 writer: connection.writer(),
                 events: connection.events(),
@@ -347,6 +363,7 @@ impl RealtimeConversationManager {
                 handoff_state: handoff.clone(),
                 session_kind,
                 event_parser,
+                user_timezone,
             });
             (task, None)
         };
@@ -790,6 +807,7 @@ async fn handle_start_inner(
         session_config,
         model_client: sess.services.model_client.clone(),
         sdp,
+        user_timezone: Some(local_time_context().1),
     };
     let start_output = sess.conversation.start(start).await?;
 
@@ -1028,6 +1046,7 @@ struct RealtimeWebrtcSidebandInputTask {
     session_kind: RealtimeSessionKind,
     event_parser: RealtimeEventParser,
     realtime_active: Arc<AtomicBool>,
+    user_timezone: Option<String>,
 }
 
 fn spawn_webrtc_sideband_input_task(input: RealtimeWebrtcSidebandInputTask) -> JoinHandle<()> {
@@ -1042,6 +1061,7 @@ fn spawn_webrtc_sideband_input_task(input: RealtimeWebrtcSidebandInputTask) -> J
         session_kind,
         event_parser,
         realtime_active,
+        user_timezone,
     } = input;
 
     tokio::spawn(async move {
@@ -1061,7 +1081,7 @@ fn spawn_webrtc_sideband_input_task(input: RealtimeWebrtcSidebandInputTask) -> J
             Ok(connection) => connection,
             Err(err) => {
                 if realtime_active.load(Ordering::Relaxed) {
-                    let mapped_error = map_api_error(err);
+                    let mapped_error = map_realtime_api_error(err, user_timezone.as_deref());
                     warn!("failed to connect realtime sideband: {mapped_error}");
                     let _ = events_tx
                         .send(RealtimeEvent::Error(mapped_error.to_string()))
@@ -1085,6 +1105,7 @@ fn spawn_webrtc_sideband_input_task(input: RealtimeWebrtcSidebandInputTask) -> J
             handoff_state,
             session_kind,
             event_parser,
+            user_timezone,
         })
         .await;
     })
@@ -1101,6 +1122,7 @@ async fn run_realtime_input_task(input: RealtimeInputTask) {
         handoff_state,
         session_kind,
         event_parser,
+        user_timezone,
     } = input;
 
     let mut output_audio_state: Option<OutputAudioState> = None;
@@ -1114,6 +1136,7 @@ async fn run_realtime_input_task(input: RealtimeInputTask) {
                     user_text,
                     &writer,
                     &events_tx,
+                    user_timezone.as_deref(),
                 )
                     .await
             }
@@ -1126,6 +1149,7 @@ async fn run_realtime_input_task(input: RealtimeInputTask) {
                     &handoff_state,
                     event_parser,
                     &mut response_create_queue,
+                    user_timezone.as_deref(),
                 )
                     .await
             }
@@ -1139,12 +1163,18 @@ async fn run_realtime_input_task(input: RealtimeInputTask) {
                     session_kind,
                     &mut output_audio_state,
                     &mut response_create_queue,
+                    user_timezone.as_deref(),
                 )
                 .await
             }
             // Audio frames captured from the user microphone.
             user_audio_frame = audio_rx.recv() => {
-                handle_user_audio_input(user_audio_frame, &writer, &events_tx)
+                handle_user_audio_input(
+                    user_audio_frame,
+                    &writer,
+                    &events_tx,
+                    user_timezone.as_deref(),
+                )
                     .await
             }
         };
@@ -1158,11 +1188,12 @@ async fn handle_user_text_input(
     text: Result<String, RecvError>,
     writer: &RealtimeWebsocketWriter,
     events_tx: &Sender<RealtimeEvent>,
+    user_timezone: Option<&str>,
 ) -> anyhow::Result<()> {
     let text = text.context("user text input channel closed")?;
 
     if let Err(err) = writer.send_conversation_item_create(text).await {
-        let mapped_error = map_api_error(err);
+        let mapped_error = map_realtime_api_error(err, user_timezone);
         warn!("failed to send input text: {mapped_error}");
         let _ = events_tx
             .send(RealtimeEvent::Error(mapped_error.to_string()))
@@ -1179,6 +1210,7 @@ async fn handle_handoff_output(
     handoff_state: &RealtimeHandoffState,
     event_parser: RealtimeEventParser,
     response_create_queue: &mut RealtimeResponseCreateQueue,
+    user_timezone: Option<&str>,
 ) -> anyhow::Result<()> {
     let handoff_output = handoff_output.context("handoff output channel closed")?;
 
@@ -1226,14 +1258,14 @@ async fn handle_handoff_output(
                     Err(err)
                 } else {
                     return response_create_queue
-                        .request_create(writer, events_tx, "handoff")
+                        .request_create(writer, events_tx, "handoff", user_timezone)
                         .await;
                 }
             }
         },
     };
     if let Err(err) = result {
-        let mapped_error = map_api_error(err);
+        let mapped_error = map_realtime_api_error(err, user_timezone);
         warn!("failed to send handoff output: {mapped_error}");
         let _ = events_tx
             .send(RealtimeEvent::Error(mapped_error.to_string()))
@@ -1251,12 +1283,13 @@ async fn handle_realtime_server_event(
     session_kind: RealtimeSessionKind,
     output_audio_state: &mut Option<OutputAudioState>,
     response_create_queue: &mut RealtimeResponseCreateQueue,
+    user_timezone: Option<&str>,
 ) -> anyhow::Result<()> {
     let event = match event {
         Ok(Some(event)) => event,
         Ok(None) => anyhow::bail!("realtime event stream ended"),
         Err(err) => {
-            let mapped_error = map_api_error(err);
+            let mapped_error = map_realtime_api_error(err, user_timezone);
             if events_tx
                 .send(RealtimeEvent::Error(mapped_error.to_string()))
                 .await
@@ -1300,7 +1333,7 @@ async fn handle_realtime_server_event(
                             )
                             .await
                     {
-                        let mapped_error = map_api_error(err);
+                        let mapped_error = map_realtime_api_error(err, user_timezone);
                         warn!("failed to truncate realtime audio: {mapped_error}");
                     }
                 }
@@ -1320,7 +1353,7 @@ async fn handle_realtime_server_event(
                 RealtimeSessionKind::V1 => {}
                 RealtimeSessionKind::V2 => {
                     response_create_queue
-                        .mark_finished(writer, events_tx, "deferred")
+                        .mark_finished(writer, events_tx, "deferred", user_timezone)
                         .await?;
                 }
             }
@@ -1332,7 +1365,7 @@ async fn handle_realtime_server_event(
                 RealtimeSessionKind::V1 => {}
                 RealtimeSessionKind::V2 => {
                     response_create_queue
-                        .mark_finished(writer, events_tx, "deferred")
+                        .mark_finished(writer, events_tx, "deferred", user_timezone)
                         .await?;
                 }
             }
@@ -1357,7 +1390,7 @@ async fn handle_realtime_server_event(
                                 )
                                 .await
                             {
-                                let mapped_error = map_api_error(err);
+                                let mapped_error = map_realtime_api_error(err, user_timezone);
                                 warn!(
                                     "failed to send handoff steering acknowledgement: {mapped_error}"
                                 );
@@ -1367,7 +1400,12 @@ async fn handle_realtime_server_event(
                                 return Err(mapped_error.into());
                             }
                             response_create_queue
-                                .request_create(writer, events_tx, "handoff steering")
+                                .request_create(
+                                    writer,
+                                    events_tx,
+                                    "handoff steering",
+                                    user_timezone,
+                                )
                                 .await?;
                         }
                         None => {
@@ -1390,7 +1428,7 @@ async fn handle_realtime_server_event(
                         .send_conversation_function_call_output(noop.call_id.clone(), String::new())
                         .await
                     {
-                        let mapped_error = map_api_error(err);
+                        let mapped_error = map_realtime_api_error(err, user_timezone);
                         warn!("failed to send realtime noop function output: {mapped_error}");
                         let _ = events_tx
                             .send(RealtimeEvent::Error(mapped_error.to_string()))
@@ -1431,11 +1469,12 @@ async fn handle_user_audio_input(
     frame: Result<RealtimeAudioFrame, RecvError>,
     writer: &RealtimeWebsocketWriter,
     events_tx: &Sender<RealtimeEvent>,
+    user_timezone: Option<&str>,
 ) -> anyhow::Result<()> {
     let frame = frame.context("user audio input channel closed")?;
 
     if let Err(err) = writer.send_audio_frame(frame).await {
-        let mapped_error = map_api_error(err);
+        let mapped_error = map_realtime_api_error(err, user_timezone);
         error!("failed to send input audio: {mapped_error}");
         let _ = events_tx
             .send(RealtimeEvent::Error(mapped_error.to_string()))
@@ -1486,6 +1525,10 @@ fn decoded_samples_per_channel(frame: &RealtimeAudioFrame) -> Option<u32> {
     let channels = usize::from(frame.num_channels.max(1));
     let samples = bytes.len().checked_div(2)?.checked_div(channels)?;
     u32::try_from(samples).ok()
+}
+
+fn map_realtime_api_error(err: ApiError, user_timezone: Option<&str>) -> CodexErr {
+    map_api_error_with_user_timezone(err, user_timezone.map(str::to_string))
 }
 
 async fn send_conversation_error(

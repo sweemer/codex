@@ -15,6 +15,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub fn map_api_error(err: ApiError) -> CodexErr {
+    map_api_error_with_user_timezone(err, /*user_timezone*/ None)
+}
+
+pub fn map_api_error_with_user_timezone(err: ApiError, user_timezone: Option<String>) -> CodexErr {
     match err {
         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
@@ -94,6 +98,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                                 resets_at,
                                 rate_limits: rate_limits.map(Box::new),
                                 promo_message,
+                                user_timezone,
                             });
                         } else if err.error.error_type.as_deref() == Some("usage_not_included") {
                             return CodexErr::UsageNotIncluded;

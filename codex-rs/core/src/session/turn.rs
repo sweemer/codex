@@ -1091,7 +1091,9 @@ async fn run_sampling_request(
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
-                return Err(CodexErr::UsageLimitReached(e));
+                return Err(CodexErr::UsageLimitReached(
+                    e.with_user_timezone_if_missing(turn_context.timezone.clone()),
+                ));
             }
             Err(err) => err,
         };
